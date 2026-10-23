@@ -42,26 +42,71 @@ CLAUDE_MANAGED_ENVIRONMENT_ID=your_environment_id
 PORT=3047
 ```
 
-## How the application was developed
+## How the app was build
 
-The browser collects inputs; the Node host validates requests; the lesson implementation produces observable evidence. The architecture page walks through the real source with numbered steps, prerequisite configuration, source filenames and code excerpts.
+### 1. Choose the delegation topology explicitly
 
-### Lesson implementation
+The allowed choices are native-thread and independent-session. An unsupported topology is rejected rather than silently switching the context boundary.
 
-[src/lesson.ts](https://github.com/luiscoco/Udemy-claude-managed-agents-lesson-c47-app/blob/main/src/lesson.ts)
+Source: [src/lesson.ts](src/lesson.ts#L13) · selected statements
 
 ```typescript
-  async run(input) {
+const topology = text(input, "topology");
 
-const topology=text(input,"topology");if(!["native-thread","independent-session"].includes(topology))throw new Error("Unknown delegation topology");
-const accepted=text(input,"expectedRevision")===text(input,"reportRevision");
-return report(accepted?"passed":"rejected","Bound a worker report to the authorized revision",{accepted,topology,sharedSandbox:topology==="native-thread",contextTransfer:topology==="native-thread"?"native topology rules":"explicit reviewed handoff required",reportRevision:text(input,"reportRevision")},["Choose the topology deliberately","Pin the specialist definition","Bind task and revision","Verify the report independently of lifecycle"]);
-
-  }
-};
+if (!["native-thread", "independent-session"].includes(topology))
+  throw new Error("Unknown delegation topology");
 ```
 
-Read the architecture page for the remaining source excerpts and explanations, including input handling and optional provider behavior. The diagram describes this application, rather than implying that an external integration has been implemented.
+### 2. Bind the report to the authorized revision
+
+The expected and reported revisions must match. Shared-sandbox and context-transfer fields describe the selected topology; this reducer checks a supplied report and does not start a thread or worker session.
+
+Source: [src/lesson.ts](src/lesson.ts#L14) · selected statements
+
+```typescript
+const accepted = text(input, "expectedRevision") === text(input, "reportRevision");
+
+return report(
+  accepted ? "passed" : "rejected",
+  "Bound a worker report to the authorized revision",
+  {
+    accepted,
+    topology,
+    sharedSandbox: topology === "native-thread",
+    contextTransfer:
+      topology === "native-thread"
+        ? "native topology rules"
+        : "explicit reviewed handoff required",
+    reportRevision: text(input, "reportRevision"),
+  },
+  [
+    "Choose the topology deliberately",
+    "Pin the specialist definition",
+    "Bind task and revision",
+    "Verify the report independently of lifecycle",
+  ],
+);
+```
+
+### Check your understanding
+
+Run **Accept the current worker report** in the application. Compare the result with these scenario expectations:
+
+```json
+{
+  "input": {
+    "topology": "independent-session",
+    "expectedRevision": "rev-7",
+    "reportRevision": "rev-7"
+  },
+  "expectedOutcome": "passed",
+  "checkEvidence": {
+    "accepted": true
+  }
+}
+```
+
+Then try **Reject a stale report**. Its expected outcome is `rejected`; identify the condition or evidence field that explains the difference.
 
 ## Validation
 
