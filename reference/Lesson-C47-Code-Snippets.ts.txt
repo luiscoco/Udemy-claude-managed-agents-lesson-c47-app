@@ -1,0 +1,89 @@
+// Delegation examples. Importing this file starts no agent or session.
+import { z } from "zod";
+import type Anthropic from "@anthropic-ai/sdk";
+import type { AgentCreateParams } from "@anthropic-ai/sdk/resources/beta/agents/agents";
+import type { BetaManagedAgentsSessionEvent as Event } from "@anthropic-ai/sdk/resources/beta/sessions/events";
+const PinnedAgent = z.strictObject({ id: z.string().min(1), version: z.number().int().positive() });
+// Native subagents are created by the coordinator at runtime, not sessions.create.
+export function nativeDelegation(reviewedWorker: unknown): NonNullable<AgentCreateParams["multiagent"]> {
+  const worker = PinnedAgent.parse(reviewedWorker);
+  return { type: "multiagent_20261001",
+    subagents: { type: "enabled", inline_agents: { type: "disabled" },
+      predefined_agents: [{ type: "agent", ...worker }] },
+    workflows: { type: "disabled" }, advisor: { type: "disabled" }
+  };
+}
+const Plan = z.strictObject({ delegationId: z.string().min(1).max(100),
+  parentSessionId: z.string().min(1).max(100), taskId: z.string().min(1).max(100),
+  worker: PinnedAgent, environmentId: z.string().min(1).max(100),
+  artifactRevision: z.string().regex(/^[a-f0-9]{64}$/), task: z.string().min(1).max(2000) });
+export type WorkerRecord = { plan: z.infer<typeof Plan>; workerSessionId?: string;
+  phase: "planned" | "creating" | "created" | "dispatched" | "creation_uncertain" | "needs_reconciliation" };
+// Caller authorizes parent, worker, environment and data handoff from trusted
+// server records. These identifiers must not come unchecked from model output.
+export function planIndependentWorker(trustedHostPlan: unknown): WorkerRecord {
+  return { plan: Plan.parse(trustedHostPlan), phase: "planned" };
+}
+export async function startIndependentWorker(client: Anthropic, record: WorkerRecord) {
+  if (record.phase !== "planned") throw new Error("Delegation already claimed");
+  record.phase = "creating";
+  let stopLocalStream: (() => void) | undefined;
+  try {
+    const worker = await client.beta.sessions.create({
+      agent: { type: "agent", id: record.plan.worker.id, version: record.plan.worker.version },
+      environment_id: record.plan.environmentId,
+      title: `Review task ${record.plan.taskId}`,
+      metadata: { parent_session_id: record.plan.parentSessionId, delegation_id: record.plan.delegationId },
+      budget: { type: "limit", max_list_cost: { amount: "25", currency: "USD" } }
+    }, { maxRetries: 0, timeout: 10000 });
+    record.workerSessionId = worker.id;
+    record.phase = "created"; // Persist this ID durably before stream/send in production.
+    const stream = await client.beta.sessions.events.stream(worker.id, {}, { timeout: 10000 });
+    stopLocalStream = () => stream.controller.abort();
+    const text = JSON.stringify({ taskId: record.plan.taskId,
+      artifactRevision: record.plan.artifactRevision, task: record.plan.task });
+    await client.beta.sessions.events.send(worker.id, { events: [{ type: "user.message",
+      content: [{ type: "text", text }] }] }, { maxRetries: 0, timeout: 10000 });
+    record.phase = "dispatched";
+    return { workerSessionId: worker.id, stream };
+  } catch (error) {
+    stopLocalStream?.(); // Stop local observation only; no remote cleanup claim.
+    record.phase = record.workerSessionId ? "needs_reconciliation" : "creation_uncertain";
+    throw error;
+  }
+}
+export function projectNativeEvent(event: Event) {
+  switch (event.type) {
+    case "session.thread_created":
+      return { eventId: event.id, threadId: event.session_thread_id, state: "created" };
+    case "session.thread_status_running":
+      return { eventId: event.id, threadId: event.session_thread_id, state: "running" };
+    case "session.thread_status_idle":
+      return { eventId: event.id, threadId: event.session_thread_id, state: event.stop_reason.type };
+    case "agent.thread_message_received":
+      return { eventId: event.id, threadId: event.from_session_thread_id, state: "report_or_question" };
+    default: return null;
+  }
+}
+const WorkerReport = z.strictObject({ taskId: z.string().min(1),
+  artifactRevision: z.string().regex(/^[a-f0-9]{64}$/), verdict: z.enum(["pass", "revise"]),
+  summary: z.string().min(1).max(2000), evidenceIds: z.array(z.string().min(1)).min(1).max(8) });
+export async function acceptWorkerReport(raw: unknown, record: WorkerRecord, currentRevision: string,
+  verifyEvidence: (taskId: string, revision: string, ids: readonly string[]) => Promise<boolean>) {
+  if (record.phase !== "dispatched") throw new Error("Worker was not dispatched");
+  // Caller obtains raw from the recorded worker's canonical events, not a browser-supplied session.
+  const report = WorkerReport.parse(raw);
+  if (report.taskId !== record.plan.taskId || report.artifactRevision !== record.plan.artifactRevision ||
+      report.artifactRevision !== currentRevision) throw new Error("Foreign or stale report");
+  const accepted = report.verdict === "pass" &&
+    await verifyEvidence(report.taskId, report.artifactRevision, report.evidenceIds);
+  return { accepted, report };
+}
+// Teaching state is in-process. Production needs durable unique delegation IDs,
+// atomic claims, quota/concurrency reservation, history reconciliation and explicit cleanup.
+// A title/metadata relation is host lineage, not a native parent-thread relationship.
+// Separate sessions do not automatically inherit parent history, mounted files or vaults;
+// reusing an environment ID does not clone the parent's live sandbox.
+// Budget amount "25" is 25 US cents, not $25. Native threads share their SESSION cap.
+// Cap enforcement is between requests; admitted in-flight work can cross the cap.
+// Scope and validate evidence independently; end_turn is lifecycle, not proof of success.
